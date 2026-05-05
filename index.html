@@ -241,6 +241,11 @@ input:focus,select:focus{outline:none;border-color:#0F6E56;box-shadow:0 0 0 3px 
 
 <div id="page-payment" class="page">
   <div class="card" style="background:#e8f4fd;border-color:#90caf9;margin-bottom:16px"><div style="font-size:13px;color:#1565c0">ℹ 결제가 완료되지 않은 학생은 <b>✅ 결제완료 버튼을 누를 때까지</b> 계속 표시돼요.</div></div>
+  <div class="toolbar" id="pay-toolbar">
+    <select id="pay-filter-type" onchange="renderPayment()" style="min-width:120px"><option value="">전체 유형</option><option value="학원">학원</option><option value="전화">전화</option><option value="개인">개인</option><option value="출강">출강</option></select>
+    <select id="pay-filter-teacher" onchange="renderPayment()" style="min-width:130px"><option value="">전체 선생님</option></select>
+    <input type="text" id="pay-search" placeholder="이름 검색..." oninput="renderPayment()" style="min-width:140px">
+  </div>
   <div id="payment-list"></div>
 </div>
 
@@ -1339,24 +1344,60 @@ function renderPayment(){
   const fm=`${TODAY.getFullYear()}-${String(TODAY.getMonth()+1).padStart(2,'0')}`;
   const dim=new Date(TODAY.getFullYear(),TODAY.getMonth()+1,0).getDate();
   const allDays=Array.from({length:dim},(_,i)=>i+1);
-  // ★ 선생님 전용 모드면 해당 선생님 학생만
-  const ft=window.TEACHER_MODE?window.TEACHER_NAME:(document.getElementById('att-teacher')?.value||'');
+  // ★ 선생님 전용 모드면 TEACHER_NAME으로 필터 (드롭다운 무관)
+  const ft=(window.TEACHER_MODE&&window.TEACHER_NAME)?window.TEACHER_NAME:(document.getElementById('att-teacher')?.value||'');
+  const filterType=document.getElementById('pay-filter-type')?.value||'';
+  const filterTeacher=document.getElementById('pay-filter-teacher')?.value||'';
+  const filterSearch=(document.getElementById('pay-search')?.value||'').toLowerCase();
+
+  // pay-filter-teacher 드롭다운 채우기
+  const ptSel=document.getElementById('pay-filter-teacher');
+  if(ptSel&&ptSel.options.length<=1){
+    teachers.forEach(t=>{const o=document.createElement('option');o.value=t.name;o.textContent=t.name;ptSel.appendChild(o);});
+  }
+  // 선생님 모드면 툴바에서 선생님 필터 숨기기
+  if(window.TEACHER_MODE){
+    const tb=document.getElementById('pay-toolbar');
+    if(tb){const tSel=tb.querySelector('#pay-filter-teacher');if(tSel)tSel.style.display='none';}
+  }
+
+  function payMatchFilter(s){
+    if(!(!ft||s.teacher===ft))return false;
+    if(filterType&&s.type!==filterType)return false;
+    if(filterTeacher&&!window.TEACHER_MODE&&s.teacher!==filterTeacher)return false;
+    if(filterSearch&&!(s.name||'').toLowerCase().includes(filterSearch))return false;
+    return true;
+  }
 
   // ★ 학원·출강: 결제완료 안 된 학생 전체 (날짜 상관없이)
   const payStudents=students.filter(s=>
     s.status==='active'&&s.payDate&&
     (s.type==='학원'||s.type==='전화'||s.type==='개인')&&
-    (!ft||s.teacher===ft)&&
+    payMatchFilter(s)&&
     !attendance[`paid-${s.id}-${fm}`]
   ).sort((a,b)=>a.payDate-b.payDate);
 
   // ★ 전화·개인: 수업 횟수 기반 (결제완료 안 된 학생)
   const lessonAlert=students.filter(s=>{
-    if(s.status!=='active'||(s.type!=='전화'&&s.type!=='개인')||!s.lessonCount)return false; // 출강 제외
+    if(s.status!=='active'||(s.type!=='전화'&&s.type!=='개인'&&s.type!=='출강'))return false;
     if(attendance[`paid-${s.id}-${fm}`])return false;
-    if(ft&&s.teacher!==ft)return false;
-    const att=allDays.filter(d=>getAtt(s.id,fm,d)==='출석').length;
-    return att>=s.lessonCount;
+    if(!payMatchFilter(s))return false;
+    // 결제 기준 횟수: 직접 입력 lessonCount 우선, 없으면 payCycle × monthlyCount 자동 계산
+    const effectiveCount=(s.lessonCount)||((s.payCycle||1)*(s.monthlyCount||0))||0;
+    if(!effectiveCount)return false;
+    // 이번 달 출석 + 이전 달들 누적 출석 (payCycle > 1이면 여러 달 합산)
+    const cycle=s.payCycle||1;
+    let totalAtt=0;
+    for(let i=0;i<cycle;i++){
+      const d=new Date(parseInt(fm.slice(0,4)),parseInt(fm.slice(5,7))-1-i,1);
+      const ym=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+      const dim2=new Date(d.getFullYear(),d.getMonth()+1,0).getDate();
+      const days2=Array.from({length:dim2},(_,j)=>j+1);
+      totalAtt+=days2.filter(day2=>getAtt(s.id,ym,day2)==='출석').length;
+    }
+    s._effectiveCount=effectiveCount;
+    s._totalAtt=totalAtt;
+    return totalAtt>=effectiveCount;
   });
 
   let html='';
@@ -1366,13 +1407,17 @@ function renderPayment(){
     html+=`<div class="card" style="border-color:#f39c12;margin-bottom:14px">
       <div style="font-size:14px;font-weight:700;margin-bottom:12px;color:#e67e22">💳 수업 횟수 결제 알림</div>
       ${lessonAlert.map(s=>{
-        const att=allDays.filter(d=>getAtt(s.id,fm,d)==='출석').length;
+        const att=s._totalAtt||0;
+        const effectiveCount=s._effectiveCount||0;
+        const cycle=s.payCycle||1;
+        const monthly=s.monthlyCount||0;
+        const cycleLabel=cycle>1?`${cycle}개월×월${monthly}회=${effectiveCount}회`:`${effectiveCount}회`;
         const msg=makeLessonPayMsg(s,att);
         const safe=msg.replace(/\\/g,'\\\\').replace(/`/g,'\\`').replace(/\$/g,'\\$');
         return `<div><div class="pay-item">
           <div>
             <div style="font-size:14px;font-weight:700">${s.name} <span class="badge ${s.type}" style="font-size:10px">${s.type}</span></div>
-            <div style="font-size:12px;color:#888;margin-top:2px">${s.teacher} · 출석 <b style="color:#e67e22">${att}회</b> (기준: ${s.lessonCount}회) · ${Number(s.amount||0).toLocaleString()}원</div>
+            <div style="font-size:12px;color:#888;margin-top:2px">${s.teacher} · 출석 <b style="color:#e67e22">${att}회</b> (기준: ${cycleLabel}) · ${Number(s.amount||0).toLocaleString()}원</div>
             ${s.payLink?`<button class="copy-btn" style="margin-top:5px" onclick="copyText('${s.payLink}','링크 복사됐어요!')">💳 결제 링크</button>`:''}
           </div>
           <div style="display:flex;flex-direction:column;gap:4px">
@@ -1416,6 +1461,19 @@ function renderPayment(){
         </div>`;
       }).join('')}
     </div>`;
+  }
+
+  // ★ 상단 요약: 결제 필요 학생 이름 뱃지
+  const allPayNeeded=[...new Map([...lessonAlert,...payStudents].map(s=>[s.id,s])).values()];
+  if(allPayNeeded.length){
+    html=`<div class="card" style="background:#fff9e6;border-color:#ffd966;margin-bottom:14px">
+      <div style="font-size:13px;font-weight:700;color:#7a5800;margin-bottom:8px">📋 결제 필요 학생 (${allPayNeeded.length}명)</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${allPayNeeded.map(s=>`<span style="background:#fff;border:1px solid #ddd;border-radius:20px;padding:4px 12px;font-size:12px;font-weight:600;display:inline-flex;align-items:center;gap:5px">
+          <span class="badge ${s.type}" style="font-size:9px;padding:1px 5px">${s.type}</span>${s.name}
+        </span>`).join('')}
+      </div>
+    </div>`+html;
   }
 
   if(!payStudents.length&&!lessonAlert.length){
@@ -1462,7 +1520,7 @@ function renderPayHistory(){
     <div class="stat"><div class="stat-label">결제완료</div><div class="stat-value green">${paidList.length}명</div></div>
     <div class="stat"><div class="stat-label">미결제</div><div class="stat-value" style="color:#c0392b">${unpaidList.length}명</div></div>
     <div class="stat"><div class="stat-label">완료 금액</div><div class="stat-value green" style="font-size:16px">${paidList.reduce((a,s)=>a+(s.amount||0),0).toLocaleString()}원</div></div>
-    <div class="stat"><div class="stat-label">미수금</div><div class="stat-value" style="color:#c0392b;font-size:16px">${unpaidList.reduce((a,s)=>a+(s.amount||0),0).toLocaleString()}원</div></div>
+    ${window.TEACHER_MODE?'':'<div class="stat"><div class="stat-label">미수금</div><div class="stat-value" style="color:#c0392b;font-size:16px">'+unpaidList.reduce((a,s)=>a+(s.amount||0),0).toLocaleString()+'원</div></div>'}
   </div>`;
 
   // 결제완료 목록
@@ -1540,9 +1598,26 @@ function renderAttendance(){
     const att=allDays.filter(d=>getAtt(s.id,fm,d)==='출석').length;
     const memoKey=`memo-${s.id}-${fm}`;
     const memoVal=attendance[memoKey]||'';
-    const lc=s.lessonCount||null;
-    const payAlert=lc&&att>=lc;
-    const payProgress=lc?`${att}/${lc}회`:`${att}회`;
+    // 결제 기준 횟수: lessonCount 우선, 없으면 payCycle × monthlyCount 자동 계산
+    const effectiveLc=(s.lessonCount)||((s.payCycle||1)*(s.monthlyCount||0))||0;
+    const lc=effectiveLc||null;
+    // payCycle > 1이면 여러 달 출석 합산
+    const cycle=s.payCycle||1;
+    let totalAttForAlert=att;
+    if(cycle>1){
+      totalAttForAlert=0;
+      for(let ci=0;ci<cycle;ci++){
+        const cd=new Date(y,m-1-ci,1);
+        const cym=cd.getFullYear()+'-'+String(cd.getMonth()+1).padStart(2,'0');
+        const cdim=new Date(cd.getFullYear(),cd.getMonth()+1,0).getDate();
+        const cdays=Array.from({length:cdim},(_,j)=>j+1);
+        totalAttForAlert+=cdays.filter(day2=>getAtt(s.id,cym,day2)==='출석').length;
+      }
+    }
+    const isPaid=!!(attendance[`paid-${s.id}-${fm}`]);
+    const payAlert=lc&&!isPaid&&totalAttForAlert>=lc;
+    const cycleLabel=cycle>1?`(${cycle}개월×월${s.monthlyCount||0}회=${lc}회)`:`/${lc}회`;
+    const payProgress=lc?`${totalAttForAlert}${cycleLabel}`:`${att}회`;
     const timeInfo=s.lessonTime?(s.lessonTime+(s.lessonTimeEnd?' ~ '+s.lessonTimeEnd:'')):'시간 미설정';
     const hasTime=!!(s.lessonTime&&s.lessonTimeEnd);
     return `<div class="card" style="${payAlert?'border-color:#f39c12;':''}">
@@ -1567,7 +1642,7 @@ function renderAttendance(){
         </div>
       </div>
       ${payAlert?`<div style="background:#fff9e6;border:1px solid #ffd966;border-radius:8px;padding:8px 12px;font-size:12px;color:#7a5800;margin-bottom:10px">
-        💳 <b>${s.name}</b>님이 ${att}회 출석했어요. 결제 안내를 보낼 시간이에요!
+        💳 <b>${s.name}</b>님이 ${totalAttForAlert}회 출석했어요. 결제 안내를 보낼 시간이에요!
         ${s.amount?'('+Number(s.amount).toLocaleString()+'원)':''}
         ${s.payLink?`<button class="copy-btn" style="margin-left:8px" onclick="copyText('${s.payLink}','결제 링크 복사됐어요!')">💳 결제 링크</button>`:''}
       </div>`:''}
@@ -1962,12 +2037,58 @@ window.openBulkImport=function(){
 function parseBulkText(text){
   const lines=text.trim().split('\n').filter(l=>l.trim());
   const rows=[];
+
+  // SheetJS 시간 소수값 → "HH:MM" 변환 (예: 0.354166 → "08:30")
+  function parseTimeVal(v){
+    if(!v&&v!==0)return null;
+    const s=String(v).trim();
+    if(!s)return null;
+    // 이미 HH:MM 형식이면 그대로 (오타 ; → : 수정)
+    if(/^\d{1,2}[;:]\d{2}$/.test(s))return s.replace(';',':').padStart(5,'0').slice(0,5);
+    // SheetJS 소수 시간값 (0~1 사이)
+    const num=parseFloat(s);
+    if(!isNaN(num)&&num>=0&&num<1){
+      const totalMin=Math.round(num*24*60);
+      const h=Math.floor(totalMin/60),m=totalMin%60;
+      return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0');
+    }
+    return null;
+  }
+
+  const validTypes=['학원','전화','개인','출강'];
   for(const line of lines){
     const cols=line.includes('\t')?line.split('\t'):line.split(',');
-    const [name,type,phone,teacher,cls,paydate,amount,payLink,lessonTime,lessonDuration,monthlyCount,payCycle,payType]=[...cols,...Array(13).fill('')];
-    if(!name||!name.trim())continue;
-    // 첫 행이 헤더면 건너뜀
-    if(name.trim()==='이름'||name.trim()==='name')continue;
+    // ★ 컬럼 위치 자동 감지: 앞에 빈칸+번호 있는 양식 vs 바로 시작하는 양식
+    let name,type,phone,teacher,cls,paydate,amount,payLink,lessonTime,lessonDuration,monthlyCount,payCycle,payType,lessonCountCol;
+    const c0=(cols[0]||'').trim();
+    const c1=(cols[1]||'').trim();
+    const c2=(cols[2]||'').trim();
+    if(c0===''&&!isNaN(parseInt(c1))&&c2){
+      // [빈칸, 번호, 이름, 유형 ...] 형식
+      [,, name,type,phone,teacher,cls,paydate,amount,payLink,lessonTime,lessonDuration,monthlyCount,payCycle,payType,lessonCountCol]=[...cols,...Array(17).fill('')];
+    } else {
+      // [이름, 유형 ...] 형식
+      [name,type,phone,teacher,cls,paydate,amount,payLink,lessonTime,lessonDuration,monthlyCount,payCycle,payType,lessonCountCol]=[...cols,...Array(14).fill('')];
+    }
+    // 이름 없으면 스킵
+    const nameTrim=(name||'').trim();
+    if(!nameTrim)continue;
+    // 헤더행 스킵
+    if(nameTrim==='이름'||nameTrim==='name')continue;
+    // 유형이 유효하지 않으면 스킵 (힌트행, 설명행 등)
+    const typeTrim=(type||'').trim();
+    if(!validTypes.includes(typeTrim))continue;
+    // 수업시간(분)에서 따옴표/특수문자 제거
+    const durStr=String(lessonDuration||'').replace(/[^\d]/g,'');
+    const parsedTime=parseTimeVal(lessonTime);
+    const parsedDur=parseInt(durStr)||20;
+    // 종료시간 계산
+    let lessonTimeEnd=null;
+    if(parsedTime){
+      const[sh,sm]=parsedTime.split(':').map(Number);
+      const tot=sh*60+sm+parsedDur;
+      lessonTimeEnd=String(Math.floor(tot/60)%24).padStart(2,'0')+':'+String(tot%60).padStart(2,'0');
+    }
     rows.push({
       name:name.trim(),
       type:(type||'학원').trim()||'학원',
@@ -1975,14 +2096,15 @@ function parseBulkText(text){
       teacher:(teacher||'').trim(),
       className:(cls||'').trim(),
       payDate:parseInt(paydate)||null,
-      amount:parseInt((amount||'').replace(/,/g,''))||0,
+      amount:parseInt(String(amount||'').replace(/[^\d]/g,''))||0,
       payLink:(payLink||'').trim(),
-      lessonTime:(lessonTime||'').trim()||null,
-      lessonDuration:parseInt(lessonDuration)||60,
-      lessonTimeEnd:(lessonTime||'').trim()?null:null, // 저장시 계산
+      lessonTime:parsedTime,
+      lessonDuration:parsedDur,
+      lessonTimeEnd,
       monthlyCount:parseInt(monthlyCount)||null,
       payCycle:parseInt(payCycle)||1,
       payType:(payType||'선불').trim()||'선불',
+      lessonCount:parseInt(lessonCountCol)||null,
     });
   }
   return rows;
@@ -1992,23 +2114,45 @@ window.loadBulkFile=async function(e){
   const file=e.target.files[0];if(!file)return;
   if(file.name.endsWith('.csv')){
     const text=await file.text();
-    document.getElementById('bulk-text').value=text.replace(/,/g,'\t');
+    document.getElementById('bulk-text').value=text;
     window.previewBulk();
-  } else {
-    // xlsx: SheetJS 사용
-    const data=await file.arrayBuffer();
-    const script=document.createElement('script');
-    script.src='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
-    script.onload=()=>{
-      const wb=XLSX.read(data);
-      const ws=wb.Sheets[wb.SheetNames[0]];
-      const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:''});
-      const tsv=rows.map(r=>r.join('\t')).join('\n');
-      document.getElementById('bulk-text').value=tsv;
-      window.previewBulk();
-    };
-    if(!window.XLSX)document.head.appendChild(script);
-    else{const wb=XLSX.read(data);const ws=wb.Sheets[wb.SheetNames[0]];const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:''});document.getElementById('bulk-text').value=rows.map(r=>r.join('\t')).join('\n');window.previewBulk();}
+    return;
+  }
+  // xlsx: SheetJS — 시간 셀을 직접 변환
+  const arrayBuf=await file.arrayBuffer();
+  function doLoad(){
+    const wb=XLSX.read(arrayBuf,{type:'array',cellDates:false});
+    const ws=wb.Sheets[wb.SheetNames[0]];
+    // 셀별로 직접 순회해서 시간값 처리
+    const range=XLSX.utils.decode_range(ws['!ref']||'A1');
+    const result=[];
+    for(let r=range.s.r;r<=range.e.r;r++){
+      const row=[];
+      for(let c=range.s.c;c<=range.e.c;c++){
+        const addr=XLSX.utils.encode_cell({r,c});
+        const cell=ws[addr];
+        if(!cell){row.push('');continue;}
+        // 시간형 숫자 셀 (0~1 사이 소수) → HH:MM 변환
+        if(cell.t==='n'&&cell.v>=0&&cell.v<1){
+          const totalMin=Math.round(cell.v*24*60);
+          const hh=Math.floor(totalMin/60),mm=totalMin%60;
+          row.push(String(hh).padStart(2,'0')+':'+String(mm).padStart(2,'0'));
+        } else {
+          // 그 외 — 표시값(w) 우선, 없으면 실제값(v)
+          row.push(cell.w!==undefined?cell.w:String(cell.v??''));
+        }
+      }
+      result.push(row.join('\t'));
+    }
+    document.getElementById('bulk-text').value=result.join('\n');
+    window.previewBulk();
+  }
+  if(window.XLSX){doLoad();}
+  else{
+    const s=document.createElement('script');
+    s.src='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    s.onload=doLoad;
+    document.head.appendChild(s);
   }
 };
 
@@ -2041,23 +2185,31 @@ window.saveBulk=async function(){
     const cls=r.className?classes.find(c=>c.name===r.className):null;
     const existing=students.find(s=>s.name===r.name);
     const id=existing?existing.id:('st'+Date.now()+'_'+Math.random().toString(36).slice(2,5));
-    const isPersonal=r.type==='개인'||r.type==='전화';
+    const isPersonal=r.type==='개인'||r.type==='전화'||r.type==='출강';
+    const lessonDur=r.lessonDuration||20;
+    // 종료시간 계산
+    let lessonTimeEnd=r.lessonTimeEnd||null;
+    if(r.lessonTime&&!lessonTimeEnd){
+      const[sh,sm]=r.lessonTime.split(':').map(Number);
+      const tot=sh*60+sm+lessonDur;
+      lessonTimeEnd=String(Math.floor(tot/60)%24).padStart(2,'0')+':'+String(tot%60).padStart(2,'0');
+    }
     const data={
       name:r.name,phone:r.phone,type:r.type,
       teacher:cls?cls.teacher:(r.teacher||''),
       course:'',
-      payDate:!isPersonal?(r.payDate||null):null,
-      lessonCount:isPersonal?(r.payDate||null):null,
+      payDate:(!isPersonal&&r.payDate)?r.payDate:null,
+      lessonCount:r.lessonCount||(isPersonal?((r.payCycle||1)*(r.monthlyCount||0))||null:null),
       amount:r.amount||0,payLink:r.payLink||'',
       start:'',status:'active',memo:'',
       classId:cls?cls.id:null,className:cls?cls.name:null,
+      lessonTime:r.lessonTime||null,
+      lessonTimeEnd,
+      lessonDuration:lessonDur,
+      monthlyCount:r.monthlyCount||null,
+      payCycle:r.payCycle||1,
+      payType:r.payType||'선불',
     };
-    // 수업 종료 시간 계산
-    if(data.lessonTime&&data.lessonDuration){
-      const[sh,sm]=data.lessonTime.split(':').map(Number);
-      const total=sh*60+sm+data.lessonDuration;
-      data.lessonTimeEnd=String(Math.floor(total/60)%24).padStart(2,'0')+':'+String(total%60).padStart(2,'0');
-    }
     await saveDoc('students',id,data);
     if(existing)replaced++;else added++;
     await new Promise(r=>setTimeout(r,20));
@@ -2410,6 +2562,8 @@ window.TEACHER_MODE=false;
 window.TEACHER_NAME='';
 window.renderCalendar=renderCalendar;
 window.renderAttendance=renderAttendance;
+window.renderPayment=renderPayment;
+window.renderPayHistory=renderPayHistory;
 window.renderSalary=renderSalary;
 window.renderStudents=renderStudents;
 
@@ -2444,14 +2598,13 @@ document.getElementById('ph-month').value=YYYYMM;
       <div style="display:flex;border-bottom:2px solid #e8e8e8;background:#fff;padding:0 12px">
         <button id="tm-tab-att" onclick="window.tmShowTab('att')" style="padding:12px 16px;border:none;background:none;cursor:pointer;font-size:13px;font-weight:700;color:#0F6E56;border-bottom:2px solid #0F6E56;margin-bottom:-2px">✅ 출결 관리</button>
         <button id="tm-tab-pay" onclick="window.tmShowTab('pay')" style="padding:12px 16px;border:none;background:none;cursor:pointer;font-size:13px;color:#888">💳 결제 알림</button>
-        <button id="tm-tab-hist" onclick="window.tmShowTab('hist')" style="padding:12px 16px;border:none;background:none;cursor:pointer;font-size:13px;color:#888">📋 결제 이력</button>
       </div>`;
     document.body.insertBefore(header,document.body.firstChild);
 
     // ★ 탭 전환 함수
     window.tmShowTab=function(tab){
       // 탭 버튼 스타일
-      ['att','pay','hist'].forEach(t=>{
+      ['att','pay'].forEach(t=>{
         const btn=document.getElementById('tm-tab-'+t);
         if(btn){
           btn.style.color=t===tab?'#0F6E56':'#888';
@@ -2461,13 +2614,13 @@ document.getElementById('ph-month').value=YYYYMM;
       });
       // 페이지 전환
       document.querySelectorAll('.page').forEach(p=>{p.style.display='none';p.classList.remove('active');});
-      const pageMap={att:'page-attendance',pay:'page-payment',hist:'page-payhistory'};
+      const pageMap={att:'page-attendance',pay:'page-payment'};
       const pg=document.getElementById(pageMap[tab]);
       if(pg){pg.style.display='block';pg.classList.add('active');}
       // 렌더링
       if(tab==='att'&&window.renderAttendance) window.renderAttendance();
       if(tab==='pay'&&window.renderPayment) window.renderPayment();
-      if(tab==='hist'&&window.renderPayHistory) window.renderPayHistory();
+
     };
 
     // 선생님 자동 선택 후 출결 렌더
